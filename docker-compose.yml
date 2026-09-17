@@ -1,0 +1,439 @@
+# Aero Bound Ventures - full local stack
+#
+# `docker compose up --build` brings up the app (frontend + backend +
+# notification worker), its data stores (Postgres, Redis, Kafka), and
+# a full observability stack (OpenTelemetry Collector, Prometheus,
+# Grafana, Loki, Promtail, Tempo, cAdvisor, node-exporter) -- see
+# README.md, docker/README.md, and observability/README.md.
+
+services:
+  # ============================================
+  # DATA STORES
+  # ============================================
+
+  db:
+    image: postgres:16
+    container_name: aero-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Creates every table (transcribed from the app's own Alembic
+      # baseline) and seeds the admin@example.com login on first boot.
+      # See docker/README.md.
+      - ./docker/init-db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    networks:
+      - aero-network
+
+  redis:
+    image: redis:latest
+    container_name: aero-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "${REDIS_PORT_HOST:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    networks:
+      - aero-network
+
+  # Web UI for browsing/inspecting Redis keys (booking cache,
+  # notification streams, rate-limit counters).
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: aero-redis-commander
+    restart: unless-stopped
+    environment:
+      REDIS_HOSTS: local:redis:6379
+      HTTP_USER: ${REDIS_COMMANDER_USER:-admin}
+      HTTP_PASSWORD: ${REDIS_COMMANDER_PASSWORD:-admin123}
+    ports:
+      - "${REDIS_COMMANDER_PORT:-8081}:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - aero-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.8.3
+    container_name: aero-kafka
+    restart: unless-stopped
+    environment:
+      KAFKA_KRAFT_MODE: "true"
+      CLUSTER_ID: "1L6GFNJKFG-243ERNJ--2323"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+    volumes:
+      - kafka_kraft:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+    networks:
+      - aero-network
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: aero-kafka-ui
+    restart: unless-stopped
+    ports:
+      - "${KAFKA_UI_PORT:-8080}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - aero-network
+
+  # ============================================
+  # APPLICATION
+  # ============================================
+
+  # One-off schema migration runner, kept for when you add real
+  # Alembic migrations on top of the SQL-seeded baseline (see
+  # docker/README.md). Not run by `docker compose up` on its own.
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: aero-backend:local
+    container_name: aero-migrate
+    profiles: ["tools"]
+    entrypoint: ["alembic", "-c", "alembic.ini"]
+    command: ["upgrade", "head"]
+    env_file: .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@db:5432/postgres}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - aero-network
+
+  fastapi-app:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: aero-backend:local
+    container_name: aero-fastapi-app
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_PORT:-8000}:80"
+    env_file: .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@db:5432/postgres}
+      OTEL_SERVICE_NAME: aero-backend-api
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=aero-bound-ventures
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:80/live')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    networks:
+      - aero-network
+
+  notification-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: aero-backend:local
+    container_name: aero-notification-worker
+    restart: unless-stopped
+    command: ["opentelemetry-instrument", "python", "-m", "backend.worker"]
+    env_file: .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@db:5432/postgres}
+      OTEL_SERVICE_NAME: aero-backend-worker
+      OTEL_RESOURCE_ATTRIBUTES: service.namespace=aero-bound-ventures
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    networks:
+      - aero-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Inlined into the browser bundle at build time. Points at the
+        # backend's host-published port since this is called from the
+        # user's browser, not from inside the docker network.
+        NEXT_PUBLIC_API_BASE_URL: http://localhost:${BACKEND_PORT:-8000}
+        NEXT_PUBLIC_WHATSAPP_NUMBER: ${NEXT_PUBLIC_WHATSAPP_NUMBER:-}
+    image: aero-frontend:local
+    container_name: aero-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      OTEL_SERVICE_NAME: aero-frontend
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    depends_on:
+      fastapi-app:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    networks:
+      - aero-network
+
+  # ============================================
+  # OBSERVABILITY
+  # ============================================
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: aero-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./observability/otel-collector/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    depends_on:
+      tempo:
+        condition: service_started
+      loki:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    networks:
+      - aero-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: aero-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      # Lets Tempo's metrics-generator push span-derived RED metrics
+      # here (see observability/tempo/tempo.yaml); non-fatal to the
+      # rest of the dashboard if unused.
+      - "--web.enable-remote-write-receiver"
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - cadvisor
+      - node-exporter
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    networks:
+      - aero-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: aero-grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SMTP_ENABLED=true
+      - GF_SMTP_HOST=${MAIL_SERVER}:${MAIL_PORT}
+      - GF_SMTP_USER=${MAIL_USERNAME}
+      - GF_SMTP_PASSWORD=${MAIL_PASSWORD}
+      - GF_SMTP_FROM_ADDRESS=${MAIL_FROM}
+      - ALERT_EMAIL_TO=${ALERT_EMAIL_TO:-admin@example.com}
+      # Unified alerting (Grafana-managed rules) is the default since
+      # Grafana 10/11; this makes it explicit.
+      - GF_ALERTING_ENABLED=false
+      - GF_UNIFIED_ALERTING_ENABLED=true
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    networks:
+      - aero-network
+
+  loki:
+    image: grafana/loki:latest
+    container_name: aero-loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yaml
+    ports:
+      - "${LOKI_PORT:-3100}:3100"
+    volumes:
+      - ./observability/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki_data:/loki
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    networks:
+      - aero-network
+
+  promtail:
+    image: grafana/promtail:latest
+    container_name: aero-promtail
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./observability/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - promtail_data:/var/lib/promtail
+    depends_on:
+      - loki
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    networks:
+      - aero-network
+
+  tempo:
+    image: grafana/tempo:latest
+    container_name: aero-tempo
+    restart: unless-stopped
+    user: root
+    command: -config.file=/etc/tempo/tempo.yaml
+    ports:
+      - "${TEMPO_PORT:-3200}:3200"
+    volumes:
+      - ./observability/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    networks:
+      - aero-network
+
+  # Per-container CPU/memory/network metrics.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: aero-cadvisor
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+    networks:
+      - aero-network
+
+  # Host (node) CPU/memory/disk metrics.
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: aero-node-exporter
+    restart: unless-stopped
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/host/root"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+    networks:
+      - aero-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_kraft:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+  promtail_data:
+  tempo_data:
+
+networks:
+  aero-network:
+    driver: bridge

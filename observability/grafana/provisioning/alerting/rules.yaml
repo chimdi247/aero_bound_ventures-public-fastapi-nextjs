@@ -1,0 +1,146 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: resource-utilization
+    folder: "Aero Bound Ventures"
+    interval: 1m
+    rules:
+      - uid: container-cpu-high
+        title: "Container CPU > 70%"
+        condition: C
+        for: 5m
+        noDataState: NoData
+        execErrState: Error
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: >-
+                sum by (name) (rate(container_cpu_usage_seconds_total{name!=""}[5m])) * 100
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [70] }
+        labels:
+          severity: warning
+          scope: container
+        annotations:
+          summary: "Container {{ $labels.name }} CPU usage is above 70%"
+          description: >-
+            Container {{ $labels.name }} has averaged over 70% CPU usage for
+            more than 5 minutes.
+
+      - uid: container-memory-high
+        title: "Container Memory > 70% of limit"
+        condition: C
+        for: 5m
+        noDataState: NoData
+        execErrState: Error
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              # Only meaningful for containers with an explicit memory
+              # limit (docker-compose.yml sets mem_limit on the app
+              # services) -- container_spec_memory_limit_bytes is a huge
+              # sentinel value for unlimited containers, which this
+              # query excludes.
+              expr: >-
+                (container_memory_usage_bytes{name!=""}
+                / on(name) container_spec_memory_limit_bytes{name!="", container_spec_memory_limit_bytes < 1e15})
+                * 100
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [70] }
+        labels:
+          severity: warning
+          scope: container
+        annotations:
+          summary: "Container {{ $labels.name }} memory usage is above 70% of its limit"
+          description: >-
+            Container {{ $labels.name }} has used over 70% of its memory
+            limit for more than 5 minutes.
+
+      - uid: node-cpu-high
+        title: "Node CPU > 70%"
+        condition: C
+        for: 5m
+        noDataState: NoData
+        execErrState: Error
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: >-
+                100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [70] }
+        labels:
+          severity: warning
+          scope: node
+        annotations:
+          summary: "Node {{ $labels.instance }} CPU usage is above 70%"
+          description: >-
+            Host {{ $labels.instance }} has averaged over 70% CPU usage for
+            more than 5 minutes.
+
+      - uid: node-memory-high
+        title: "Node Memory > 70%"
+        condition: C
+        for: 5m
+        noDataState: NoData
+        execErrState: Error
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: >-
+                (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [70] }
+        labels:
+          severity: warning
+          scope: node
+        annotations:
+          summary: "Node {{ $labels.instance }} memory usage is above 70%"
+          description: >-
+            Host {{ $labels.instance }} has used over 70% of its available
+            memory for more than 5 minutes.

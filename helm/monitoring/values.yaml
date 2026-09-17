@@ -1,0 +1,85 @@
+prometheus:
+  alertmanager:
+    enabled: false
+  kube-state-metrics:
+    enabled: false
+  prometheus-node-exporter:
+    enabled: false
+  prometheus-pushgateway:
+    enabled: false
+
+  rbac:
+    create: false
+  server:
+    automountServiceAccountToken: false
+    fullnameOverride: prometheus
+    persistentVolume:
+      enabled: false
+
+  scrapeConfigs:
+    prometheus:
+      enabled: false
+    kubernetes-api-servers:
+      enabled: false
+    kubernetes-nodes:
+      enabled: false
+    kubernetes-nodes-cadvisor:
+      enabled: false
+    kubernetes-service-endpoints:
+      enabled: false
+    kubernetes-service-endpoints-slow:
+      enabled: false
+    prometheus-pushgateway:
+      enabled: false
+    kubernetes-services:
+      enabled: false
+    kubernetes-pods:
+      enabled: false
+    kubernetes-pods-slow:
+      enabled: false
+    backend:
+      enabled: true
+      metrics_path: /metrics
+      static_configs:
+        - targets:
+            - aero-backend-api.aero-staging.svc.cluster.local:80
+
+grafana:
+  fullnameOverride: grafana
+  admin:
+    existingSecret: grafana-admin-credentials
+    userKey: admin-user
+    passwordKey: admin-password
+  automountServiceAccountToken: false
+  rbac:
+    create: false
+  testFramework:
+    enabled: false
+  persistence:
+    enabled: false
+  service:
+    type: ClusterIP
+  ingress:
+    enabled: true
+    ingressClassName: aero-staging-alb
+    annotations:
+      alb.ingress.kubernetes.io/healthcheck-path: /api/health
+    path: /
+    pathType: Prefix
+    hosts:
+      - grafana-staging.aeroboundventures.com
+  grafana.ini:
+    server:
+      domain: grafana-staging.aeroboundventures.com
+      root_url: https://grafana-staging.aeroboundventures.com
+    security:
+      cookie_secure: true
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          url: http://prometheus
+          access: proxy
+          isDefault: true

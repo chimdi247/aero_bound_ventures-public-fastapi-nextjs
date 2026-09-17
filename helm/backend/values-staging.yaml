@@ -1,0 +1,32 @@
+# Replaced with real ECR and service endpoints in the AWS deployment streams.
+image:
+  repository: replace-me.dkr.ecr.us-east-2.amazonaws.com/aero-backend
+  tag: replace-me
+
+api:
+  replicas: 1
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+  resources:
+    requests:
+      cpu: 125m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+worker:
+  replicas: 1
+
+ingress:
+  enabled: true
+  className: aero-staging-alb
+  host: api-staging.aeroboundventures.com
+  paths:
+    - path: /
+      pathType: Prefix
+
+infrastructure:
+  # The explicit REDIS_URL Pod env from this ConfigMap overrides Doppler's copy.
+  existingConfigMapName: backend-infrastructure

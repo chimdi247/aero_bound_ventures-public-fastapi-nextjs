@@ -1,0 +1,33 @@
+from pydantic import EmailStr
+import uuid
+from sqlmodel import SQLModel, Field, Relationship
+from sqlalchemy import Column, DateTime
+from typing import TYPE_CHECKING
+from datetime import datetime
+
+from .permissions import Group, Permission, UserGroup, UserPermission
+
+if TYPE_CHECKING:
+    from .bookings import Booking
+    from .notifications import Notification
+
+
+class UserInDB(SQLModel, table=True):
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True, nullable=False)
+    email: EmailStr = Field(index=True, unique=True)
+    password: str | None = Field(default=None, nullable=True)
+    google_id: str | None = Field(default=None, nullable=True, index=True, unique=True)
+    auth_provider: str = Field(default="email")
+    reset_token: str | None = Field(default=None, nullable=True)
+    reset_token_expires: datetime | None = Field(
+        sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+
+    is_active: bool = Field(default=True, nullable=False)
+    is_superuser: bool = Field(default=False, nullable=False)
+    bookings: list["Booking"] = Relationship(back_populates="user")
+    groups: list["Group"] = Relationship(back_populates="users", link_model=UserGroup)
+    permissions: list["Permission"] = Relationship(
+        back_populates="users", link_model=UserPermission
+    )
+    notifications: list["Notification"] = Relationship(back_populates="user")

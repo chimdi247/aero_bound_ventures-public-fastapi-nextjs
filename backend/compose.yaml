@@ -1,0 +1,180 @@
+services:
+  fastapi-app:
+    build: .
+    image: aero-backend:local
+    container_name: fastapi-app
+    restart: always
+    ports:
+      - "8000:80"
+    command:
+      - doppler
+      - run
+      - --
+      - fastapi
+      - run
+      - main.py
+      - --port
+      - "80"
+      - --host
+      - 0.0.0.0
+    environment:
+      - DOPPLER_TOKEN=${DOPPLER_TOKEN}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      - FLIGHT_SERVICE_PROVIDER=${FLIGHT_SERVICE_PROVIDER:-amadeus}
+    depends_on:
+      redis:
+        condition: service_started
+  notification-worker:
+    image: aero-backend:local
+    restart: always
+    command:
+      - doppler
+      - run
+      - --
+      - python
+      - -m
+      - backend.worker
+    environment:
+      - DOPPLER_TOKEN=${DOPPLER_TOKEN}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      redis:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+  migrate:
+    image: aero-backend:local
+    profiles: ["tools"]
+    entrypoint:
+      - doppler
+      - run
+      - --
+      - alembic
+      - -c
+      - alembic.ini
+    command:
+      - upgrade
+      - head
+    environment:
+      - DOPPLER_TOKEN=${DOPPLER_TOKEN}
+  db:
+    image: postgres:16
+    container_name: postgres-db
+    restart: always
+    profiles: ["local"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+  redis:
+      image: redis:latest
+      restart: always
+      volumes:
+        - redis_data:/data
+      command: redis-server --appendonly yes
+  kafka:
+    image: confluentinc/cp-kafka:7.8.3
+    container_name: kafka
+    restart: always
+    environment:
+      KAFKA_KRAFT_MODE: 'true'
+      CLUSTER_ID: '1L6GFNJKFG-243ERNJ--2323'
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    volumes:
+      - kafka_kraft:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    restart: always
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: always
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: always
+    ports:
+      - "127.0.0.1:3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SMTP_ENABLED=true
+      - GF_SMTP_HOST=${MAIL_SERVER}:${MAIL_PORT}
+      - GF_SMTP_USER=${MAIL_USERNAME}
+      - GF_SMTP_PASSWORD=${MAIL_PASSWORD}
+      - GF_SMTP_FROM=${MAIL_FROM}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+  loki:
+    image: grafana/loki:latest
+    container_name: loki
+    restart: always
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki_data:/loki
+  promtail:
+    image: grafana/promtail:latest
+    restart: always
+    container_name: promtail
+    volumes:
+      - ./promtail-config.yml:/etc/promtail/config.yml
+      - ./.logs:/.logs:ro
+      - promtail_data:/var/lib/promtail
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+
+
+volumes:
+  postgres_data:
+  redis_data:
+  kafka_kraft:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+  promtail_data:

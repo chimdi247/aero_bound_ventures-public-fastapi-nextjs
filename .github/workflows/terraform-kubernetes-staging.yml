@@ -1,0 +1,467 @@
+name: Provision EKS Staging Infrastructure
+
+on:
+  workflow_call:
+    inputs:
+      operation:
+        description: Staging infrastructure operation
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Staging infrastructure operation
+        required: true
+        default: apply
+        type: choice
+        options:
+          - apply
+          - activate-https
+          - destroy
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "terraform/kubernetes-staging/**"
+      - "helm/backend-secrets/**"
+      - "gitops/bootstrap/**"
+      - "gitops/staging/root-application.yaml"
+      - "gitops/staging/applications/**"
+      - "gitops/staging/values/backend-secrets.yaml"
+      - ".github/workflows/terraform-kubernetes-staging.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: terraform-kubernetes-staging-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-2
+  TF_IN_AUTOMATION: "true"
+  EKS_CLUSTER_NAME: aero-backend-staging
+  KUBERNETES_NAMESPACE: aero-staging
+  STAGING_API_HOSTNAME: api-staging.aeroboundventures.com
+  STAGING_GRAFANA_HOSTNAME: grafana-staging.aeroboundventures.com
+  INFRASTRUCTURE_CONFIG_MAP: backend-infrastructure
+  DOPPLER_OPERATOR_NAMESPACE: doppler-operator-system
+  ARGOCD_NAMESPACE: argocd
+  GITOPS_REPOSITORY: git@github.com:KNehe/aero_bound_ventures.git
+
+jobs:
+  terraform:
+    name: Plan or Apply Staging Infrastructure
+    if: github.repository == 'KNehe/aero_bound_ventures'
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Configure infrastructure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-eks-staging-terraform
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Initialize Terraform
+        run: terraform -chdir=terraform/kubernetes-staging init -input=false
+
+      - name: Check Terraform formatting
+        run: terraform -chdir=terraform/kubernetes-staging fmt -check -recursive
+
+      - name: Validate Terraform
+        run: terraform -chdir=terraform/kubernetes-staging validate
+
+      - name: Plan staging infrastructure
+        if: github.event_name == 'pull_request'
+        run: terraform -chdir=terraform/kubernetes-staging plan -input=false -no-color
+
+      - name: Create staging apply plan
+        if: github.event_name == 'push' || inputs.operation == 'apply' || inputs.operation == 'activate-https'
+        run: terraform -chdir=terraform/kubernetes-staging plan -input=false -out=tfplan
+
+      - name: Apply staging infrastructure
+        if: github.event_name == 'push' || inputs.operation == 'apply' || inputs.operation == 'activate-https'
+        run: terraform -chdir=terraform/kubernetes-staging apply -input=false -auto-approve tfplan
+
+      - name: Set up kubectl
+        if: github.event_name == 'push' || inputs.operation == 'apply' || inputs.operation == 'activate-https' || inputs.operation == 'destroy'
+        uses: azure/setup-kubectl@v5
+
+      - name: Set up Helm
+        if: github.event_name == 'push' || inputs.operation == 'apply'
+        uses: azure/setup-helm@v5
+
+      - name: Configure staging kubeconfig
+        if: github.event_name == 'push' || inputs.operation == 'apply' || inputs.operation == 'activate-https'
+        run: |
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}"
+
+      - name: Destroy staging infrastructure
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'destroy'
+        run: |
+          if aws eks describe-cluster \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}" >/dev/null 2>&1; then
+            aws eks update-kubeconfig \
+              --region "${AWS_REGION}" \
+              --name "${EKS_CLUSTER_NAME}"
+
+            # Stop GitOps reconciliation before deleting the ALB-backed Ingress.
+            # The root and child Application finalizers remove their managed
+            # resources in dependency order.
+            if kubectl get crd applications.argoproj.io >/dev/null 2>&1; then
+              kubectl --namespace "${ARGOCD_NAMESPACE}" \
+                delete application/aero-staging-root \
+                --ignore-not-found \
+                --wait=true \
+                --timeout=10m
+            fi
+
+            # Also remove a legacy or partially adopted Ingress that was not
+            # deleted through the Argo CD Application cascade.
+            kubectl --namespace "${KUBERNETES_NAMESPACE}" \
+              delete ingress/aero-backend-api \
+              --ignore-not-found \
+              --wait=true \
+              --timeout=10m
+          fi
+
+          terraform -chdir=terraform/kubernetes-staging \
+            destroy -input=false -auto-approve
+
+      - name: Verify ACM certificate issuance
+        if: inputs.operation == 'activate-https'
+        run: |
+          certificate_status="$(terraform \
+            -chdir=terraform/kubernetes-staging \
+            output -raw staging_https_certificate_status)"
+
+          if [[ "${certificate_status}" != "ISSUED" ]]; then
+            echo "ACM certificate status is ${certificate_status}; add the validation CNAME with your DNS provider before activating HTTPS." >&2
+            exit 1
+          fi
+
+      - name: Configure public ALB ingress class
+        id: ingress-class
+        if: github.event_name == 'push' || inputs.operation == 'apply' || inputs.operation == 'activate-https'
+        run: |
+          set -o pipefail
+
+          kubectl create namespace "${KUBERNETES_NAMESPACE}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label namespace "${KUBERNETES_NAMESPACE}" \
+            environment=staging --overwrite
+
+          manifest_output=staging_alb_ingress_class_http_manifest
+          apply_ingress_class=true
+          https_enabled=false
+          shared_alb_enabled=false
+          desired_certificate_status="$(terraform \
+            -chdir=terraform/kubernetes-staging \
+            output -raw staging_https_certificate_status)"
+          current_certificate_arn="$(kubectl \
+            get ingressclassparams/aero-staging-alb \
+            --output jsonpath='{.spec.certificateARNs[0]}' \
+            2>/dev/null || true)"
+          current_group_name="$(kubectl \
+            get ingressclassparams/aero-staging-alb \
+            --output jsonpath='{.spec.group.name}' \
+            2>/dev/null || true)"
+
+          if [[ "${{ inputs.operation }}" == "activate-https" || "${desired_certificate_status}" == "ISSUED" ]]; then
+            manifest_output=staging_alb_ingress_class_https_manifest
+            https_enabled=true
+          elif [[ -n "${current_certificate_arn}" ]]; then
+            apply_ingress_class=false
+            https_enabled=true
+            echo "The combined certificate is pending; preserving the active API certificate."
+          fi
+
+          if [[ "${apply_ingress_class}" == "true" ]]; then
+            terraform -chdir=terraform/kubernetes-staging \
+              output -raw "${manifest_output}" | kubectl apply -f -
+            shared_alb_enabled=true
+          elif [[ "${current_group_name}" == "aero-staging" ]]; then
+            shared_alb_enabled=true
+          fi
+          echo "https_enabled=${https_enabled}" >> "${GITHUB_OUTPUT}"
+          echo "shared_alb_enabled=${shared_alb_enabled}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish staging infrastructure configuration
+        if: github.event_name == 'push' || inputs.operation == 'apply' || inputs.operation == 'activate-https'
+        run: |
+          # Redis endpoints can change after recreation, so Terraform publishes
+          # the current non-secret endpoint instead of storing it in Doppler.
+          redis_endpoint="$(terraform \
+            -chdir=terraform/kubernetes-staging \
+            output -raw redis_primary_endpoint)"
+
+          kubectl create namespace "${KUBERNETES_NAMESPACE}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl --namespace "${KUBERNETES_NAMESPACE}" \
+            create configmap "${INFRASTRUCTURE_CONFIG_MAP}" \
+            --from-literal="REDIS_URL=rediss://${redis_endpoint}:6379" \
+            --from-literal="STAGING_HTTPS_ENABLED=${{ steps.ingress-class.outputs.https_enabled }}" \
+            --from-literal="STAGING_SHARED_ALB_ENABLED=${{ steps.ingress-class.outputs.shared_alb_enabled }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Verify staging HTTPS endpoint
+        if: inputs.operation == 'activate-https'
+        run: |
+          for attempt in {1..60}; do
+            if curl --fail --silent \
+              --connect-timeout 3 \
+              --max-time 5 \
+              "https://${STAGING_API_HOSTNAME}/live" >/dev/null; then
+              curl --fail --silent --show-error \
+                --connect-timeout 3 \
+                --max-time 5 \
+                "https://${STAGING_API_HOSTNAME}/ready"
+              echo "### Staging HTTPS" >> "${GITHUB_STEP_SUMMARY}"
+              echo "https://${STAGING_API_HOSTNAME}" >> "${GITHUB_STEP_SUMMARY}"
+              exit 0
+            fi
+
+            if [[ "${attempt}" == "60" ]]; then
+              echo "HTTPS endpoint did not become ready within 10 minutes." >&2
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+      - name: Publish ACM DNS validation record
+        if: github.event_name == 'push' || inputs.operation == 'apply'
+        run: |
+          certificate_status="$(terraform \
+            -chdir=terraform/kubernetes-staging \
+            output -raw staging_https_certificate_status)"
+          validation_records="$(terraform \
+            -chdir=terraform/kubernetes-staging \
+            output -json staging_certificate_validation_records)"
+
+          echo "### ACM DNS Validation" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Certificate status: ${certificate_status}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Ensure these records exist with your DNS provider:" >> "${GITHUB_STEP_SUMMARY}"
+          jq --raw-output \
+            'to_entries[] | "`\(.value.name)` `\(.value.type)` `\(.value.value)`"' \
+            <<< "${validation_records}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Install Doppler Operator
+        if: github.event_name == 'push' || inputs.operation == 'apply'
+        run: |
+          helm repo add doppler https://helm.doppler.com --force-update
+          helm repo update doppler
+          helm upgrade --install doppler-operator \
+            doppler/doppler-kubernetes-operator \
+            --namespace "${DOPPLER_OPERATOR_NAMESPACE}" \
+            --create-namespace \
+            --version 1.5.7 \
+            --wait \
+            --timeout 5m
+
+      - name: Install Argo CD
+        if: github.event_name == 'push' || inputs.operation == 'apply'
+        run: |
+          helm repo add argo https://argoproj.github.io/argo-helm --force-update
+          helm repo update argo
+          helm upgrade --install argocd argo/argo-cd --version 10.2.1 \
+            --namespace "${ARGOCD_NAMESPACE}" \
+            --create-namespace \
+            --values gitops/bootstrap/argocd-values.yaml \
+            --wait \
+            --timeout 10m
+
+      - name: Configure GitOps deployment access
+        if: github.event_name == 'push' || inputs.operation == 'apply'
+        run: kubectl apply -f gitops/bootstrap/deploy-role-rbac.yaml
+
+      - name: Configure Argo CD repository authentication
+        if: github.event_name == 'push' || inputs.operation == 'apply'
+        env:
+          ARGOCD_REPO_SSH_PRIVATE_KEY: ${{ secrets.ARGOCD_REPO_SSH_PRIVATE_KEY }}
+        run: |
+          set -o pipefail
+          : "${ARGOCD_REPO_SSH_PRIVATE_KEY:?ARGOCD_REPO_SSH_PRIVATE_KEY is required}"
+
+          printf '%s\n' "${ARGOCD_REPO_SSH_PRIVATE_KEY}" |
+            kubectl --namespace "${ARGOCD_NAMESPACE}" \
+              create secret generic aero-bound-repository \
+              --from-literal=type=git \
+              --from-literal="url=${GITOPS_REPOSITORY}" \
+              --from-file=sshPrivateKey=/dev/stdin \
+              --dry-run=client -o yaml |
+            kubectl apply -f -
+
+          kubectl --namespace "${ARGOCD_NAMESPACE}" \
+            label secret aero-bound-repository \
+            argocd.argoproj.io/secret-type=repository \
+            --overwrite
+
+      - name: Configure Doppler authentication
+        if: github.event_name == 'push' || inputs.operation == 'apply'
+        env:
+          DOPPLER_STAGING_TOKEN: ${{ secrets.DOPPLER_STAGING_TOKEN }}
+        run: |
+          : "${DOPPLER_STAGING_TOKEN:?DOPPLER_STAGING_TOKEN is required}"
+
+          kubectl create namespace "${KUBERNETES_NAMESPACE}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          printf '%s' "${DOPPLER_STAGING_TOKEN}" |
+            kubectl --namespace "${DOPPLER_OPERATOR_NAMESPACE}" \
+              create secret generic doppler-token-secret \
+              --from-file=serviceToken=/dev/stdin \
+              --dry-run=client -o yaml |
+            kubectl apply -f -
+
+      - name: Configure Grafana authentication
+        if: github.event_name == 'push' || inputs.operation == 'apply'
+        env:
+          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+        run: |
+          set -o pipefail
+          : "${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD is required}"
+
+          kubectl create namespace monitoring \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl label namespace monitoring environment=staging --overwrite
+
+          grafana_secret_result="$(
+            printf '%s' "${GRAFANA_ADMIN_PASSWORD}" |
+              kubectl --namespace monitoring \
+                create secret generic grafana-admin-credentials \
+                --from-literal=admin-user=admin \
+                --from-file=admin-password=/dev/stdin \
+                --dry-run=client -o yaml |
+              kubectl apply -f -
+          )"
+          echo "${grafana_secret_result}"
+
+          if [[ "${grafana_secret_result}" != *"unchanged" ]] && \
+             kubectl --namespace monitoring get deployment/grafana >/dev/null 2>&1; then
+            kubectl --namespace monitoring rollout restart deployment/grafana
+          fi
+
+      - name: Bootstrap staging GitOps
+        if: github.event_name == 'push' || inputs.operation == 'apply'
+        run: |
+          kubectl apply -f gitops/staging/root-application.yaml
+
+          kubectl --namespace "${ARGOCD_NAMESPACE}" wait \
+            --for=create application/aero-staging-backend-secrets \
+            --timeout=5m
+
+          kubectl --namespace "${DOPPLER_OPERATOR_NAMESPACE}" wait \
+            --for=condition=secrets.doppler.com/SecretSyncReady \
+            dopplersecret/aero-backend \
+            --timeout=120s
+
+          kubectl --namespace "${KUBERNETES_NAMESPACE}" wait \
+            --for=create secret/backend-secrets \
+            --timeout=120s
+
+          kubectl --namespace "${ARGOCD_NAMESPACE}" wait \
+            --for=create application/aero-staging-backend \
+            --timeout=120s
+
+          kubectl --namespace "${ARGOCD_NAMESPACE}" wait \
+            --for=create application/aero-staging-monitoring \
+            --timeout=5m
+
+          kubectl --namespace "${ARGOCD_NAMESPACE}" wait \
+            --for=jsonpath='{.status.sync.status}'=Synced \
+            application/aero-staging-monitoring \
+            --timeout=10m
+
+          kubectl --namespace "${ARGOCD_NAMESPACE}" wait \
+            --for=jsonpath='{.status.health.status}'=Healthy \
+            application/aero-staging-monitoring \
+            --timeout=10m
+
+          kubectl --namespace monitoring wait \
+            --for=create ingress/grafana \
+            --timeout=120s
+
+          backend_alb_hostname="$(kubectl --namespace "${KUBERNETES_NAMESPACE}" \
+            get ingress/aero-backend-api \
+            --output jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+          : "${backend_alb_hostname:?Backend Ingress has no ALB hostname}"
+
+          kubectl --namespace monitoring wait \
+            --for=jsonpath='{.status.loadBalancer.ingress[0].hostname}'="${backend_alb_hostname}" \
+            ingress/grafana \
+            --timeout=10m
+
+          stale_migration_image="$(kubectl \
+            --namespace "${KUBERNETES_NAMESPACE}" \
+            get job/aero-backend-migration \
+            --ignore-not-found \
+            --output jsonpath='{.spec.template.spec.containers[0].image}')"
+
+          if [[ "${stale_migration_image}" == *":bootstrap-required" ]]; then
+            echo "Removing the stale bootstrap migration operation."
+            kubectl --namespace "${ARGOCD_NAMESPACE}" \
+              patch application/aero-staging-backend \
+              --type=merge \
+              --patch='{"status":{"operationState":{"phase":"Terminating"}}}'
+
+            for attempt in {1..30}; do
+              operation_phase="$(kubectl \
+                --namespace "${ARGOCD_NAMESPACE}" \
+                get application/aero-staging-backend \
+                --output jsonpath='{.status.operationState.phase}')"
+
+              if [[ "${operation_phase}" != "Running" && \
+                    "${operation_phase}" != "Terminating" ]]; then
+                break
+              fi
+
+              if [[ "${attempt}" == "30" ]]; then
+                echo "The stale Argo CD operation did not terminate within 60 seconds." >&2
+                exit 1
+              fi
+
+              sleep 2
+            done
+
+            kubectl --namespace "${KUBERNETES_NAMESPACE}" \
+              delete job/aero-backend-migration \
+              --ignore-not-found \
+              --wait=true \
+              --timeout=2m
+          fi
+
+      - name: Diagnose failed GitOps bootstrap
+        if: failure() && (github.event_name == 'push' || inputs.operation == 'apply')
+        run: |
+          kubectl --namespace "${ARGOCD_NAMESPACE}" \
+            get applications --output wide || true
+
+          kubectl --namespace "${ARGOCD_NAMESPACE}" \
+            describe application/aero-staging-root || true
+
+          kubectl --namespace "${ARGOCD_NAMESPACE}" \
+            describe application/aero-staging-monitoring || true
+
+          kubectl --namespace monitoring \
+            get deployments,pods,services,ingresses --output wide || true
+
+          kubectl --namespace monitoring \
+            describe ingress/grafana || true
+
+          kubectl --namespace "${ARGOCD_NAMESPACE}" \
+            logs deployment/argocd-repo-server \
+            --tail=200 || true
