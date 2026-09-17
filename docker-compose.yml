@@ -299,6 +299,10 @@ services:
     image: grafana/grafana:latest
     container_name: aero-grafana
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512m
     ports:
       - "${GRAFANA_PORT:-3001}:3000"
     environment:
