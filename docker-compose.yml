@@ -326,10 +326,6 @@ services:
       - prometheus
       - loki
       - tempo
-    deploy:
-      resources:
-        limits:
-          memory: 256m
     networks:
       - aero-network
 
