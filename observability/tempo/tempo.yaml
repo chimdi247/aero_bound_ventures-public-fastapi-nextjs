@@ -1,5 +1,3 @@
-stream_over_http_enabled: true
-
 server:
   http_listen_port: 3200
 
@@ -12,22 +10,6 @@ distributor:
         http:
           endpoint: 0.0.0.0:4318
 
-tempo:
-  ingester:
-    max_block_duration: 5m
-  compactor:
-    compaction:
-      block_retention: 48h
-  metrics_generator:
-    registry:
-      external_labels:
-        source: tempo
-    storage:
-      path: /var/tempo/generator/wal
-      remote_write:
-        - url: http://prometheus:9090/api/v1/write
-          send_exemplars: true
-
 storage:
   trace:
     backend: local
@@ -36,7 +18,19 @@ storage:
     wal:
       path: /var/tempo/wal
 
+metrics_generator:
+  registry:
+    external_labels:
+      source: tempo
+  storage:
+    path: /var/tempo/generator/wal
+    remote_write:
+      - url: http://prometheus:9090/api/v1/write
+        send_exemplars: true
+
 overrides:
   defaults:
     metrics_generator:
-      processors: [service-graphs, span-metrics]
+      processors:
+        - service-graphs
+        - span-metrics
